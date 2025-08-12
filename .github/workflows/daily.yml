@@ -2,28 +2,35 @@ name: Scrape daily
 
 on:
   schedule:
-    - cron: "10 3 * * *"   # 03:10 UTC ≈ 05:10 Zurich (été)
+    - cron: "10 3 * * *"   # 03:10 UTC (≈ 05:10 Zurich l'été)
   workflow_dispatch: {}     # bouton "Run workflow"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-      - name: Install Playwright
+          # pas de cache => évite l'avertissement de lockfile manquant
+
+      - name: Install deps
         run: |
           npm i
           npx playwright install --with-deps chromium
+
       - name: Run scraper
+        run: node scrape.mjs
         env:
           AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
-          AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
+          AIRTABLE_BASE:  ${{ secrets.AIRTABLE_BASE }}
           AIRTABLE_TABLE: ${{ secrets.AIRTABLE_TABLE }}
-        run: npm run scrape
+
       - name: Upload CSV (artifact)
         uses: actions/upload-artifact@v4
         with:
