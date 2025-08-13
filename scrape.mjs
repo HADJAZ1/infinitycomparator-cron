@@ -1,533 +1,468 @@
-// scrape.mjs — Saint-Graal (sans LLM), robuste & gratuit
-// Node >= 20 requis. Sortie: data/latest.csv
-//
-// ENV utiles :
-//   HEADLESS=1            # 0 pour voir le navigateur
-//   FAST_MODE=1           # timeouts plus courts lors des tests
-//   MAX_PAGES=60          # limite d'URLs traitées
-//   OPERATORS=yallo,sunrise  # filtres par domaine
-//   BLOCK_RESOURCES=1     # bloque images/medias/fonts (accélère)
-//   AIRTABLE_TOKEN=...    # (optionnel) clé Airtable
-//   AIRTABLE_BASE=...     # (optionnel) id base
-//   AIRTABLE_TABLE=Offres # (optionnel) table (nom ou id)
-//
-// Usage local :
-//   npm i playwright
-//   npx playwright install chromium
-//   node scrape.mjs
-//
-// GitHub Actions :
-//   - Ajoute secrets Airtable si besoin
-//   - Lance le workflow (cron/jour)
-//   - Récupère l’artifact latest.csv
+// scrape.mjs
+// ===============================================================
+// Scraper Yallo (Mobile) – onglet "Tout"
+// Sortie: data/latest.csv (+ JSON debug)
+// Node 20+, Playwright Chromium
+// ===============================================================
 
-import { chromium } from 'playwright';
-import fs from 'fs/promises';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { chromium, devices } from "playwright";
 
-// ---------- Paths ----------
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, 'data');
-await fs.mkdir(DATA_DIR, { recursive: true });
+// -------------------- Config via ENV (sécurisée & bornée) --------------------
+const ENV = (k, d) => (process.env[k] ?? d);
+const OP               = (ENV("OP", "yallo") + "").toLowerCase();
+const HEADLESS         = ENV("HEADLESS", "1") === "1";
+const BLOCK_RESOURCES  = ENV("BLOCK_RESOURCES", "1") === "1";
+const MAX_PAGES        = clampInt(ENV("MAX_PAGES", "60"), 1, 300);
+const NAV_TIMEOUT_MS   = clampInt(ENV("NAV_TIMEOUT_MS", "25000"), 8000, 60000);
+const MAX_RUNTIME_MIN  = clampInt(ENV("MAX_RUNTIME_MIN", "10"), 3, 30);
 
-// ---------- Config ----------
-const HEADLESS        = process.env.HEADLESS !== '0';
-const FAST_MODE       = process.env.FAST_MODE === '1';
-const MAX_PAGES       = parseInt(process.env.MAX_PAGES || '70', 10);
-const NAV_TIMEOUT     = FAST_MODE ? 12000 : 22000;
-const SEL_TIMEOUT     = FAST_MODE ? 2500  : 5000;
-const PAGE_BUDGET_MS  = FAST_MODE ? 18000 : 32000;
-const RETRIES         = 2;
-const CONCURRENCY     = FAST_MODE ? 3 : 4;
-const BLOCK_RESOURCES = process.env.BLOCK_RESOURCES !== '0';
+const AIRTABLE_TOKEN   = ENV("AIRTABLE_TOKEN", "");
+const AIRTABLE_BASE    = ENV("AIRTABLE_BASE", "");
+const AIRTABLE_TABLE   = ENV("AIRTABLE_TABLE", "");
 
-const OPERATORS_FILTER = (process.env.OPERATORS || 'yallo,sunrise')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const OUT_DIR  = "data";
+const OUT_CSV  = path.join(OUT_DIR, "latest.csv");
+const OUT_JSON = path.join(OUT_DIR, "latest.json");
 
-// ---------- CSV headers ----------
-const HEADERS = [
-  "Référence de l'offre","Opérateur","Nom de l'offre","Prix CHF/mois","Prix initial CHF","Rabais (%)","TV",
-  "Rapidité réseau Mbps","SMS & MMS (Suisse)","Appels en Suisse ( Heure )",
-  "Données en itinérance (Go)","Minutes roaming ( Heure )","Pays voisins inclus",
-  "Type offre","Expiration","~Émission de CO2 (kg/an)","Durée d'engagement"
-];
-
-// ---------- Utils ----------
-const log = (...a) => console.log('•', ...a);
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const clean = (s) => String(s ?? '').replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
-const numberish = (s) => {
-  const m = String(s ?? '').match(/-?\d+(?:[.,]\d+)?/);
-  return m ? parseFloat(m[0].replace(',','.')) : null;
-};
-const toCSV = (rows) => [
-  HEADERS.join(','),
-  ...rows.map(r => HEADERS.map(k => {
-    let v = r[k];
-    if (v === undefined || v === null) v = '';
-    const s = String(v).replace(/"/g,'""');
-    return /[",\n]/.test(s) ? `"${s}"` : s;
-  }).join(','))
-].join('\n');
-
-// ---------- Référence stable (hash) ----------
-function slugUpper(s) {
-  return String(s ?? '')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
-    .replace(/[^a-zA-Z0-9]+/g,'_').replace(/^_|_$/g,'')
-    .toUpperCase();
+// -------------------- Helpers génériques --------------------
+function clampInt(v, min, max){
+  let n = Number.parseInt(v, 10); if (Number.isNaN(n)) n = min;
+  return Math.max(min, Math.min(max, n));
 }
-function fnv32a(str){
-  let h = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++){
-    h ^= str.charCodeAt(i);
-    h = (h >>> 0) * 0x01000193;
-  }
-  return (h >>> 0).toString(16).toUpperCase().padStart(8,'0');
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function ensureDir(p){ if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive:true }); }
+function textClean(s){ return String(s ?? "").replace(/\s+/g, " ").trim(); }
+function slugify(str){
+  return String(str ?? "")
+    .normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "")
+    .toLowerCase();
 }
-function typeCode(typeOffre) {
-  const t = String(typeOffre||'');
-  if (t.startsWith('1')) return 'T1';
-  if (t.startsWith('2')) return 'T2';
-  if (t.startsWith('3')) return 'T3';
-  return 'TX';
+function shortHash(s, len=6){
+  return crypto.createHash("sha1").update(String(s)).digest("hex").slice(0, len);
 }
-function makeRef({ operator, title, url, typeOffre }) {
-  const op = slugUpper(operator).slice(0,8);
-  const tc = typeCode(typeOffre);
-  const sl = slugUpper(title).slice(0,24);
-  let pathOnly = '';
-  try { pathOnly = new URL(url).pathname; } catch {}
-  const h8 = fnv32a(`${pathOnly}|${sl}`).slice(0,8);
-  return `${op}_${tc}_${sl}_${h8}`;
+function nowIso(){ return new Date().toISOString(); }
+
+// --------- parsing num/price/units robustes (CHF, Go, Gbit/s → Mbps) ---------
+function parsePriceCHF(s){
+  if (!s) return null;
+  const t = s.replace(",", ".").replace(/\s/g, "");
+  const m = t.match(/(?:CHF)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:CHF)?/i);
+  return m ? Number.parseFloat(m[1]) : null;
 }
-const seenRefs = new Set();
-function ensureUniqueRef(ref){
-  let r = ref, n = 2;
-  while (seenRefs.has(r)) r = `${ref}_${n++}`;
-  seenRefs.add(r);
-  return r;
+function parsePercent(s){
+  if (!s) return null;
+  const m = s.replace(",", ".").match(/([0-9]+(?:\.[0-9]+)?)\s*%/);
+  return m ? Number.parseFloat(m[1]) : null;
+}
+function parseNumber(s){
+  if (!s) return null;
+  const v = s.replace(",", ".").match(/-?\d+(?:\.\d+)?/);
+  return v ? Number.parseFloat(v[0]) : null;
+}
+function parseMbpsFromSpeedText(s){
+  const t = (s || "").toLowerCase().replace(",", ".").replace(/\s+/g, " ");
+  const g = t.match(/([0-9]+(?:\.[0-9]+)?)\s*gbit\/s/);
+  if (g) return Math.round(Number.parseFloat(g[1]) * 1000);
+  const m = t.match(/([0-9]+(?:\.[0-9]+)?)\s*mbit\/s/);
+  if (m) return Math.round(Number.parseFloat(m[1]));
+  return null;
+}
+function parseDataGo(s){
+  if (!s) return 0;
+  const t = s.toLowerCase();
+  if (t.includes("illimit")) return Infinity;
+  const m = t.replace(",", ".").match(/([0-9]+(?:\.[0-9]+)?)\s*go/);
+  return m ? Number.parseFloat(m[1]) : (t.includes("—") ? 0 : 0);
+}
+function parseMinutes(s){
+  if (!s) return 0;
+  const t = s.toLowerCase();
+  if (t.includes("illimit")) return Infinity;
+  const m = t.match(/([0-9]+)\s*min/);
+  return m ? Number.parseInt(m[1], 10) : (t.includes("—") ? 0 : 0);
 }
 
-// ---------- CO₂ (ta logique intégrée) ----------
-function numCO2(v){
-  if (v == null) return 0;
-  const s = String(v);
-  if (s.toLowerCase().includes('illimité')) return Infinity;
-  const m = s.replace(',', '.').match(/-?\d+(\.\d+)?/);
-  return m ? parseFloat(m[0]) : 0;
+// -------------------- CO₂ (ta méthode, portée en JS) --------------------
+function numForCO2(v){
+  if (!v) return 0;
+  const t = String(v).toLowerCase();
+  if (t.includes("illimit")) return Infinity;
+  const m = String(v).replace(",", ".").match(/\d+\.?\d*/);
+  return m ? Number.parseFloat(m[0]) : 0;
 }
-function calculateCO2(row) {
-  const type_offer = row['Type offre'] || '';
-  const speed = (() => { const n = numberish(row['Rapidité réseau Mbps']); return (n==null||!isFinite(n)) ? 0 : n; })();
-  const data_itin = row['Données en itinérance (Go)'] || '';
-  const min_roam = row['Minutes roaming ( Heure )'] || '';
-  const tv = row['TV'] || '';
-  const name = (row["Nom de l'offre"] || '').toLowerCase();
+function calculateCO2(row){
+  const type_offer = row["Type offre"] || "";
+  const speed = row["Rapidité réseau Mbps"];
+  const data_itin = row["Données en itinérance (Go)"];
+  const min_roam = row["Minutes roaming ( Heure )"];
+  const tv = row["TV"] || "Non";
+  const name = (row["Nom de l'offre"] || "").toLowerCase();
 
-  if (type_offer.includes('1 ')) {
-    let base = speed <= 300 ? 12.5 : 14.5;
-    if ((row['Appels en Suisse ( Heure )'] || '').toLowerCase().includes('illimité')) base += 0.5;
-    if ((row['SMS & MMS (Suisse)'] || '').toLowerCase().includes('illimité')) base += 0.5;
+  if (type_offer.includes("1 ")) {
+    let base = (speed && speed <= 300) ? 12.5 : 14.5;
+    if ((row["Appels en Suisse ( Heure )"] || "").toLowerCase().includes("illimit")) base += 0.5;
+    if ((row["SMS & MMS (Suisse)"] || "").toLowerCase().includes("illimit")) base += 0.5;
 
-    const roaming_go = numCO2(data_itin);
+    const roaming_go = numForCO2(data_itin);
     const is_unlimited_roam_go = roaming_go === Infinity;
-    const is_unlimited_roam_min = String(min_roam).toLowerCase().includes('illimit');
+    const is_unlimited_roam_min = numForCO2(min_roam) === Infinity;
 
-    const roaming_cont = is_unlimited_roam_go ? 18.3 : (roaming_go * 0.35);
+    const roaming_cont = is_unlimited_roam_go ? 18.3 : roaming_go * 0.35;
     base += roaming_cont;
     if (is_unlimited_roam_min) base -= 12.2;
-    if (name.includes('noir') || name.includes('black')) base -= 0.5;
+    if (name.includes("noir") || name.includes("black")) base -= 0.5;
+    return round1(base);
+  }
 
-    return Math.round(base * 10) / 10;
-  } else if (type_offer.includes('2 ') || type_offer.includes('3 ')) {
-    let base;
-    if (name.includes('fiber')) base = 30.0;
-    else if (name.includes('5g')) base = 45.0;
-    else base = 35.0;
-
-    if (tv && tv.toLowerCase().includes('chaine')) base += 50.0;
-    return Math.round(base * 10) / 10;
+  if (type_offer.includes("2 ") || type_offer.includes("3 ")) {
+    let base = 35.0;
+    if (name.includes("fiber")) base = 30.0;
+    else if (name.includes("5g")) base = 45.0;
+    if (tv !== "Non" && tv.toLowerCase().includes("chaine")) base += 50.0;
+    return round1(base);
   }
   return null;
 }
+function round1(n){ return Math.round(Number(n) * 10) / 10; }
 
-// ---------- Canonicalisation ----------
-function canonicalize(row, pageText='') {
-  const txt = (v) => String(v||'').toLowerCase();
-  const normInf = (v) =>
-    /illimit|unlimited|ohne limit|flat|illimitato|∞/i.test(String(v||'')) ? 'Illimité' :
-    (String(v||'').trim()==='-' ? '' : String(v||''));
-
-  row["Données en itinérance (Go)"] = normInf(row["Données en itinérance (Go)"]);
-  row["Minutes roaming ( Heure )"]  = normInf(row["Minutes roaming ( Heure )"]);
-
-  // Vitesse -> Mbps
-  let sp = String(row["Rapidité réseau Mbps"]||'');
-  const g = sp.match(/(\d+(?:[.,]\d+)?)\s*g(?:bit|bps)?/i);
-  const m = sp.match(/(\d+(?:[.,]\d+)?)\s*m(?:bit|bps)?/i);
-  if (g) sp = String(Math.round(parseFloat(g[1].replace(',','.')) * 1000));
-  else if (m) sp = String(Math.round(parseFloat(m[1].replace(',','.'))));
-  row["Rapidité réseau Mbps"] = sp.replace(/[^\d]/g,'') || '';
-
-  // TV
-  const tvt = txt(row["TV"]);
-  row["TV"] = /280\s*cha/i.test(tvt) ? "280 Chaines" : (/tv|replay|box/.test(tvt) ? "280 Chaines" : "Non");
-
-  // Type offre (déduit du texte de page si vide)
-  const page = txt(pageText);
-  const type = txt(row["Type offre"]);
-  const isHome = /home|internet|cable|fiber|fibre|box|tv|5g home/i.test(page) || /home|cable|fiber|tv/.test(type);
-  const hasTV  = row["TV"] !== "Non";
-  row["Type offre"] = isHome ? (hasTV ? "3 Home Cable Box + TV" : "2 Home Cable Box") : "1 SIM ( Mobile )";
-
-  // Rabais entier
-  let rb = String(row["Rabais (%)"]||'').replace('%','').replace(',','.');
-  const rbn = numberish(rb);
-  row["Rabais (%)"] = (rbn==null || !isFinite(rbn)) ? '' : String(Math.round(rbn));
-
-  // Prix → nombres
-  const pn = numberish(row["Prix CHF/mois"]);     row["Prix CHF/mois"]     = (pn??'');
-  const po = numberish(row["Prix initial CHF"]);  row["Prix initial CHF"]  = (po??'');
-
-  // Durée / Expiration si trouvables
-  if (!row["Durée d'engagement"] && /sans engagement/i.test(page)) row["Durée d'engagement"] = 'Sans engagement';
-  if (!row["Expiration"] && /remise permanente|rabais permanent/i.test(page)) row["Expiration"] = 'Remise permanente';
-
-  return row;
+// -------------------- CSV utils --------------------
+const CSV_HEADERS = [
+  "Référence de l'offre",
+  "Opérateur",
+  "Nom de l'offre",
+  "Prix CHF/mois",
+  "Prix initial CHF",
+  "Rabais (%)",
+  "TV",
+  "Rapidité réseau Mbps",
+  "SMS & MMS (Suisse)",
+  "Appels en Suisse ( Heure )",
+  "Données en itinérance (Go)",
+  "Minutes roaming ( Heure )",
+  "Pays voisins inclus",
+  "Type offre",
+  "Expiration",
+  "~Émission de CO2 (kg/an)",
+  "Durée d'engagement"
+];
+function csvEscape(v){
+  const s = String(v ?? "");
+  if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+function toCSV(rows){
+  const lines = [];
+  lines.push(CSV_HEADERS.join(","));
+  for (const r of rows) {
+    const line = CSV_HEADERS.map(h => csvEscape(r[h])).join(",");
+    lines.push(line);
+  }
+  return lines.join("\n");
 }
 
-// ---------- Sitemaps ----------
-async function gatherCandidateURLs() {
-  const sitemaps = [];
-  if (OPERATORS_FILTER.includes('yallo')) {
-    sitemaps.push('https://www.yallo.ch/sitemap.xml', 'https://www.yallo.ch/fr/sitemap.xml');
-  }
-  if (OPERATORS_FILTER.includes('sunrise')) {
-    sitemaps.push('https://www.sunrise.ch/sitemap.xml');
-  }
-
-  const urls = new Set();
-  for (const sm of sitemaps) {
-    try {
-      const res = await fetch(sm, { redirect:'follow' });
-      const xml = await res.text();
-      for (const loc of xml.matchAll(/<loc>(.*?)<\/loc>/g)) urls.add(String(loc[1]));
-    } catch (e) { log('Sitemap KO:', sm, e.message); }
-  }
-
-  const want = [...urls].filter(u => {
-    let host = '';
-    try { host = new URL(u).hostname; } catch { return false; }
-    const op = host.includes('yallo') ? 'yallo' : host.includes('sunrise') ? 'sunrise' : 'other';
-    if (!OPERATORS_FILTER.includes(op)) return false;
-
-    // garde pages offres
-    if (!/(mobile|roaming|home|internet|5g|cable|fiber|max|europe|swiss|travel)/i.test(u)) return false;
-
-    // exclusions
-    if (/\.(xml|pdf|jpg|jpeg|png|gif|webp|svg)$/i.test(u)) return false;
-    if (/login|myyallo|privacy|terms|sitemap|media|assets|image|support|help/i.test(u)) return false;
-    return true;
-  });
-
-  const list = want.slice(0, MAX_PAGES);
-  if (!list.length) list.push('https://www.yallo.ch/fr/mobile');
-  log(`URLs candidates: ${list.length}/${want.length} (MAX_PAGES=${MAX_PAGES})`);
-  return list;
+// -------------------- Génération de référence stable --------------------
+function generateReference({ operator, name, price, ts }){
+  // YALLO-<slugName>-<prix_sans_point>-<hash6>
+  const slug = slugify(name).slice(0, 40) || "offre";
+  const p = String(Math.round(Number(price || 0) * 100)); // 12.90 -> 1290
+  const h = shortHash(`${operator}|${name}|${price}|${String(ts).slice(0,10)}`, 6);
+  return `YALLO-${slug}-${p}-${h}`.toUpperCase();
 }
 
-// ---------- Cookies ----------
-async function acceptCookies(page) {
-  const labels = ['Accepter','J’accepte','Tout accepter','OK','Accept all','Agree','Einverstanden','Alles akzeptieren'];
-  for (const t of labels) {
-    try {
-      const b = page.getByRole('button', { name: new RegExp(t, 'i') });
-      if (await b.first().isVisible({ timeout: 800 })) {
-        await b.first().click({ timeout: 800 }).catch(()=>{});
-        return;
-      }
-    } catch {}
-  }
-  // fallback sélecteurs connus
-  const sel = ['#onetrust-accept-btn-handler','button[aria-label*="accept"]','button[aria-label*="accepter"]'];
-  for (const s of sel) {
-    try {
-      const l = page.locator(s).first();
-      if (await l.isVisible({ timeout: 800 })) { await l.click({ timeout: 800 }).catch(()=>{}); return; }
-    } catch {}
-  }
-}
+// -------------------- Scrape Yallo Mobile (onglet "Tout") --------------------
+async function scrapeYalloMobile(context){
+  const page = await context.newPage();
+  page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+  page.setDefaultTimeout(NAV_TIMEOUT_MS);
 
-// ---------- Extraction regex + mini-sélecteurs ----------
-function extractByRegex(text) {
-  const t = clean(text);
+  const url = "https://www.yallo.ch/fr/mobile-products";
+  console.log(`[${nowIso()}] Yallo → ${url}`);
+  await safeGoto(page, url);
 
-  const mNow = t.match(/CHF\s*([0-9]+(?:[.,][0-9]+)?)/i) || t.match(/([0-9]+(?:[.,][0-9]+)?)\s*CHF/i);
-  const mOld = t.match(/au lieu de\s*(?:CHF\s*)?([0-9]+(?:[.,][0-9]+)?)/i);
-  const priceNow = mNow ? parseFloat(mNow[1].replace(',','.')) : '';
-  const priceOld = mOld ? parseFloat(mOld[1].replace(',','.')) : '';
-  const discount = (() => {
-    const m = t.match(/(\d{1,3})\s*%/);
-    if (m) return m[1];
-    if (priceNow && priceOld) return String(Math.round((1 - priceNow/priceOld)*100));
-    return '';
-  })();
+  await acceptCookiesIfAny(page);
+  await selectTabTout(page);
+  await waitForCards(page);
 
-  // speed
-  let speedMbps = '';
-  const mSp = t.match(/(\d{1,5})\s*Mbit\/s/i) || t.match(/(\d{1,3})\s*Gbit\/s/i) || t.match(/(\d{1,3})\s*Gbps/i);
-  if (mSp) speedMbps = /Gbit|Gbps/i.test(mSp[0]) ? String(parseInt(mSp[1],10)*1000) : String(parseInt(mSp[1],10));
-  if (/10000\s*Mbit\/s/i.test(t) || /10\s*Gbit\/s/i.test(t)) speedMbps = '10000';
+  const cards = await page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll(`
+      [class*="card"], [class*="Card"], [class*="product"], [data-testid*="card"], article, section
+    `)).filter(el => {
+      const txt = (el.innerText || "").toLowerCase();
+      return txt.includes("données") && txt.includes("appels") && /chf/i.test(txt);
+    });
 
-  // TV
-  const tv = /280\s*Cha[iî]nes/i.test(t) ? '280 Chaines' : 'Non';
+    const byPrice = Array.from(document.querySelectorAll("div")).filter(el => {
+      const t = (el.innerText || "").toLowerCase();
+      return /chf/.test(t) && t.includes("appels");
+    });
 
-  // appels/sms CH (détection simple mais robuste)
-  const appels = /appel/i.test(t) && /illimit/i.test(t) ? 'Illimité' : (/1\s*h/i.test(t) ? '1 h' : '');
-  const sms    = /sms/i.test(t) && /illimit/i.test(t) ? 'Illimité' :
-                 (/0[,\.]?15.*sms/i.test(t) || /0[,\.]?50.*mms/i.test(t)) ? '0.15/SMS, 0.50/MMS' : '';
+    const uniq = new Set();
+    [...candidates, ...byPrice].forEach(el => uniq.add(el));
 
-  // roaming data / minutes
-  const roamData = /roam|itin/i.test(t) && /illimit/i.test(t) ? 'Illimité' :
-                   (t.match(/(\d+(?:[.,]\d+)?)\s*Go/i)?.[1]?.replace(',','.') ?? '');
-  const roamMin  = /roam|itin/i.test(t) && /illimit/i.test(t) && /(min|h)/i.test(t) ? 'Illimité' :
-                   (t.match(/(\d+)\s*h\s*(?:roam|itin)/i)?.[1] || t.match(/(\d+)\s*min\s*(?:roam|itin)/i)?.[1] || '');
-
-  // pays voisins
-  const neighbors = /FR,\s*DE,\s*IT,\s*AT,\s*LI/i.test(t) ? 'FR, DE, IT, AT, LI' :
-                    /Europe,\s*USA,\s*Canada,\s*Turquie/i.test(t) ? 'Europe, USA, Canada, Turquie' :
-                    /Pays voisins \+ Balkans/i.test(t) ? 'Pays voisins + Balkans' :
-                    /8 pays les plus populaires/i.test(t) ? '8 pays les plus populaires' :
-                    /Top 10 destinations monde/i.test(t) ? 'Top 10 destinations monde' :
-                    /Europe, US, Canada/i.test(t) ? 'Europe, US, Canada' :
-                    /Pays voisins/i.test(t) ? 'Pays voisins' : '';
-
-  const expiration = /remise permanente|rabais permanent/i.test(t) ? 'Remise permanente' : '';
-  const engagement = /sans engagement/i.test(t) ? 'Sans engagement' : '';
-
-  const typeOffre = /home|internet|cable|fiber|fibre|box/i.test(t)
-    ? (tv==='280 Chaines' ? '3 Home Cable Box + TV' : '2 Home Cable Box')
-    : '1 SIM ( Mobile )';
-
-  return { priceNow, priceOld, discount, speedMbps, tv, appels, sms, roamData, roamMin, neighbors, expiration, engagement, typeOffre };
-}
-
-async function extractOfferFromPage(page, url) {
-  const started = Date.now();
-  await page.goto(url, { waitUntil:'domcontentloaded', timeout: NAV_TIMEOUT }).catch(()=>{});
-  await acceptCookies(page);
-
-  let title = '';
-  try { title = clean(await page.locator('h1').first().innerText({ timeout: SEL_TIMEOUT }).catch(()=> '')); } catch {}
-  if (!title) {
-    try {
-      const og = await page.locator('meta[property="og:title"]').getAttribute('content', { timeout: 800 }).catch(()=> '');
-      title = clean(og||'');
-    } catch {}
-  }
-  const bodyText = clean(await page.innerText('body').catch(()=> ''));
-  const op = new URL(url).hostname.includes('yallo') ? 'Yallo' :
-             new URL(url).hostname.includes('sunrise') ? 'Sunrise' : 'Opérateur';
-
-  // Extraction regex “grosse maille”
-  const ex = extractByRegex(bodyText);
-
-  // Fallback sélecteurs prix si besoin
-  if (!ex.priceNow) {
-    const selCandidates = [
-      '[data-test*="price"]','[data-testid*="price"]','.price','.offer-price','.product-price','[class*="Price"]'
-    ];
-    for (const s of selCandidates) {
-      try {
-        const raw = clean(await page.locator(s).first().innerText({ timeout: 800 }).catch(()=> ''));
-        const m = raw.match(/([0-9]+(?:[.,][0-9]+)?)/);
-        if (m) { ex.priceNow = parseFloat(m[1].replace(',','.')); break; }
-      } catch {}
-    }
-  }
-  if (!ex.priceOld) {
-    const selOld = ['.old-price','.price-old','[class*="strike"]','[class*="strikethrough"]','s[class*="price"]'];
-    for (const s of selOld) {
-      try {
-        const raw = clean(await page.locator(s).first().innerText({ timeout: 800 }).catch(()=> ''));
-        const m = raw.match(/([0-9]+(?:[.,][0-9]+)?)/);
-        if (m) { ex.priceOld = parseFloat(m[1].replace(',','.')); break; }
-      } catch {}
-    }
-  }
-  if (!ex.discount && ex.priceNow && ex.priceOld) {
-    ex.discount = String(Math.round((1 - ex.priceNow/ex.priceOld)*100));
-  }
-
-  // Construit la ligne
-  const row = {
-    "Référence de l'offre": "", // rempli après
-    "Opérateur": op,
-    "Nom de l'offre": title || 'Offre',
-    "Prix CHF/mois": ex.priceNow || '',
-    "Prix initial CHF": ex.priceOld || '',
-    "Rabais (%)": ex.discount || '',
-    "TV": ex.tv || 'Non',
-    "Rapidité réseau Mbps": ex.speedMbps || '',
-    "SMS & MMS (Suisse)": ex.sms || '',
-    "Appels en Suisse ( Heure )": ex.appels || '',
-    "Données en itinérance (Go)": ex.roamData || '',
-    "Minutes roaming ( Heure )": ex.roamMin || '',
-    "Pays voisins inclus": ex.neighbors || '',
-    "Type offre": ex.typeOffre || '',
-    "Expiration": ex.expiration || '',
-    "~Émission de CO2 (kg/an)": "",
-    "Durée d'engagement": ex.engagement || ''
-  };
-
-  canonicalize(row, bodyText);
-  const co2 = calculateCO2(row);
-  if (co2 !== null) row["~Émission de CO2 (kg/an)"] = co2;
-
-  row["Référence de l'offre"] = ensureUniqueRef(
-    makeRef({ operator: row["Opérateur"], title: row["Nom de l'offre"], url, typeOffre: row["Type offre"] })
-  );
-
-  // Respect d’un budget de temps par page
-  const elapsed = Date.now() - started;
-  if (elapsed < PAGE_BUDGET_MS) await sleep(10);
-
-  return row;
-}
-
-// ---------- Pool de workers ----------
-async function runWithPool(context, urls) {
-  const results = [];
-  let index = 0;
-  let ok = 0, ko = 0;
-
-  async function worker(id) {
-    const page = await context.newPage();
-    page.setDefaultTimeout(SEL_TIMEOUT);
-    page.setDefaultNavigationTimeout(NAV_TIMEOUT);
-
-    while (true) {
-      const my = index++;
-      if (my >= urls.length) break;
-      const url = urls[my];
-
-      let lastErr = null;
-      for (let r=0; r<=RETRIES; r++) {
-        try {
-          const row = await extractOfferFromPage(page, url);
-          if (row && row["Nom de l'offre"]) {
-            results.push(row);
-            ok++;
-            break;
-          }
-        } catch (e) {
-          lastErr = e;
-          await sleep(300);
-        }
-      }
-      if (lastErr) { ko++; log(`Skip (${id}):`, url, lastErr.message); }
-    }
-    await page.close().catch(()=>{});
-  }
-
-  const workers = [];
-  const count = Math.min(CONCURRENCY, urls.length);
-  for (let i=0; i<count; i++) workers.push(worker(i+1));
-  await Promise.all(workers);
-
-  log(`OK=${ok} | KO=${ko}`);
-  return results;
-}
-
-// ---------- Airtable (optionnel) ----------
-async function pushAirtable(rows) {
-  const { AIRTABLE_TOKEN, AIRTABLE_BASE, AIRTABLE_TABLE } = process.env;
-  if (!AIRTABLE_TOKEN || !AIRTABLE_BASE || !AIRTABLE_TABLE) {
-    log('Airtable non configuré → skip');
-    return;
-  }
-  const chunk = 10;
-  for (let i=0; i<rows.length; i+=chunk) {
-    const part = rows.slice(i, i+chunk).map(r => ({
-      fields: {
-        "Opérateur": r["Opérateur"],
-        "Référence de l'offre": r["Référence de l'offre"],
-        "Type offre": r["Type offre"],
-        "Nom de l'offre": r["Nom de l'offre"],
-        "Prix CHF/mois": r["Prix CHF/mois"] || null,
-        "Prix initial CHF": r["Prix initial CHF"] || null,
-        "Rabais (%)": r["Rabais (%)"] || null,
-        "TV": r["TV"] ? [r["TV"]] : [],
-        "Rapidité réseau Mbps": r["Rapidité réseau Mbps"] || null,
-        "SMS & MMS (Suisse)": r["SMS & MMS (Suisse)"] || null,
-        "Appels en Suisse ( Heure )": r["Appels en Suisse ( Heure )"] || null,
-        "Données en itinérance (Go)": r["Données en itinérance (Go)"] || null,
-        "Minutes roaming ( Heure )": r["Minutes roaming ( Heure )"] || null,
-        "Pays voisins inclus": r["Pays voisins inclus"] || null,
-        "Expiration": r["Expiration"] || null,
-        "~Émission de CO2 (kg/an)": r["~Émission de CO2 (kg/an)"] || null,
-        "Durée d'engagement": r["Durée d'engagement"] || null
-      }
+    return Array.from(uniq).map(el => ({
+      text: (el.innerText || "").replace(/\s+/g, " ").trim()
     }));
-
-    const res = await fetch(
-      `https://api.airtable.com/v0/${AIRTABLE_BASE}/${encodeURIComponent(AIRTABLE_TABLE)}`,
-      {
-        method:'PATCH',
-        headers:{ Authorization:`Bearer ${AIRTABLE_TOKEN}`, 'Content-Type':'application/json' },
-        body: JSON.stringify({
-          performUpsert: { fieldsToMergeOn: ["Référence de l'offre"] },
-          records: part
-        })
-      }
-    );
-    if (!res.ok) {
-      const txt = await res.text().catch(()=> '');
-      throw new Error(`Airtable ${res.status}: ${txt}`);
-    }
-  }
-  log('✅ Airtable mis à jour.');
-}
-
-// ---------- Main ----------
-async function main() {
-  log('Collecte des URLs…');
-  const urls = await gatherCandidateURLs();
-
-  const browser = await chromium.launch({ headless: HEADLESS });
-  const context = await browser.newContext({
-    viewport: { width: 1366, height: 900 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36'
   });
 
-  if (BLOCK_RESOURCES) {
-    await context.route('**/*', (route) => {
-      const type = route.request().resourceType();
-      const url  = route.request().url();
-      const block = ['image','media','font'].includes(type) ||
-                    /google-analytics|gtm|doubleclick|hotjar|optimizely/i.test(url);
-      if (block) return route.abort();
-      route.continue();
+  console.log(`[${nowIso()}] Yallo → cartes candidates: ${cards.length}`);
+
+  const rows = [];
+  for (let idx = 0; idx < Math.min(cards.length, MAX_PAGES); idx++) {
+    hardStop();
+
+    const c = cards[idx];
+    const parsed = parseYalloCard(c.text);
+    if (!parsed || !parsed.name || !parsed.price) continue;
+
+    const row = {
+      "Référence de l'offre": generateReference({
+        operator: "Yallo",
+        name: parsed.name,
+        price: parsed.price,
+        ts: Date.now()
+      }),
+      "Opérateur": "Yallo",
+      "Nom de l'offre": parsed.name,
+      "Prix CHF/mois": parsed.price ?? "",
+      "Prix initial CHF": parsed.initialPrice ?? "",
+      "Rabais (%)": parsed.rabaisPct ?? "",
+      "TV": "Non",
+      "Rapidité réseau Mbps": parsed.speedMbps ?? "",
+      "SMS & MMS (Suisse)": parsed.smsMms ?? "",
+      "Appels en Suisse ( Heure )": parsed.appels ?? "",
+      "Données en itinérance (Go)": parsed.roamDataGo ?? "",
+      "Minutes roaming ( Heure )": parsed.roamMinutes ?? "",
+      "Pays voisins inclus": parsed.roamCountries ?? "",
+      "Type offre": "1 SIM ( Mobile )",
+      "Expiration": parsed.isPermaDiscount ? "Remise permanente" : "",
+      "~Émission de CO2 (kg/an)": "",
+      "Durée d'engagement": "Sans engagement"
+    };
+    row["~Émission de CO2 (kg/an)"] = calculateCO2({
+      ...row,
+      "Rapidité réseau Mbps": row["Rapidité réseau Mbps"] || 0
+    });
+
+    rows.push(row);
+  }
+
+  await page.close();
+  return rows;
+}
+
+// -------------------- Parsers spécifiques Yallo --------------------
+function parseYalloCard(text){
+  const t = textClean(text);
+
+  // Nom (ligne clé avant le prix)
+  let name = null;
+  {
+    const parts = t.split(/chf/i)[0].split(/\n| {2,}/).map(x => x.trim()).filter(Boolean);
+    name = parts.reverse().find(x => !/\d+%/.test(x) && !/(suisse|itinérance|données|appels)/i.test(x)) || parts[0];
+  }
+
+  // Prix + ancien prix + % rabais
+  const price = parsePriceCHF(t);
+  let initialPrice = null;
+  const old1 = t.match(/au lieu de\s*([0-9]+(?:[\.,][0-9]+)?)\s*[-.–]?/i);
+  if (old1) initialPrice = parseFloat(old1[1].replace(",", "."));
+  if (!initialPrice){
+    const old2 = t.match(/au lieu de\s*CHF?\s*([0-9]+(?:[\.,][0-9]+)?)/i);
+    if (old2) initialPrice = parseFloat(old2[1].replace(",", "."));
+  }
+  let rabaisPct = parsePercent(t);
+  if (!rabaisPct && initialPrice && price) rabaisPct = Math.round( (1 - price / initialPrice) * 100 );
+
+  // Suisse (données + vitesse)
+  let speedMbps = null;
+  let swissDataGo = null;
+  {
+    const m = t.match(/Suisse(.+?)(Itinérance|CHF|Appels|Rabais|À saisir|En savoir plus|$)/i);
+    const bloc = m ? m[1] : t;
+    swissDataGo = parseDataGo(bloc);
+    speedMbps = parseMbpsFromSpeedText(bloc);
+    if (!Number.isFinite(swissDataGo)) swissDataGo = bloc.toLowerCase().includes("illimit") ? Infinity : swissDataGo;
+  }
+
+  // Appels (Suisse)
+  let appels = "";
+  {
+    const m = t.match(/Appels(.+?)(Itinérance|CHF|Rabais|À saisir|En savoir plus|$)/i);
+    const bloc = m ? m[1] : "";
+    if (/illimit/i.test(bloc)) appels = "Illimité";
+    else {
+      const mins = parseMinutes(bloc);
+      appels = mins === Infinity ? "Illimité" : (mins > 0 ? `${mins} min.` : "");
+    }
+  }
+
+  // SMS & MMS (heuristique)
+  let smsMms = /start|début/i.test(name || "") ? "0,15CHF/SMS & 0,50CHF/MMS" : "Illimité";
+
+  // Itinérance
+  let roamDataGo = 0, roamMinutes = 0, roamCountries = "";
+  {
+    const m = t.match(/Itinérance(.+?)(CHF|À saisir|En savoir plus|$)/i);
+    const bloc = m ? m[1] : "";
+    roamDataGo = parseDataGo(bloc);
+    roamMinutes = parseMinutes(bloc);
+    const countriesMatch = bloc.match(/(pays voisins|europe.*?tur|eu élargie.*?pays|8 pays les plus populaires|fr, de, it, at, li)/i);
+    roamCountries = countriesMatch ? titleCase(countriesMatch[1]) : ( /voisin/i.test(bloc) ? "Pays voisins" : "" );
+  }
+
+  const isPermaDiscount = /rabais pour toujours|rabais permanent/i.test(t);
+
+  return {
+    name, price, initialPrice, rabaisPct,
+    swissDataGo, speedMbps, appels, smsMms,
+    roamDataGo, roamMinutes, roamCountries,
+    isPermaDiscount
+  };
+}
+function titleCase(s){ return String(s||"").toLowerCase().replace(/\b\w/g, m => m.toUpperCase()); }
+
+// -------------------- Navigation Helpers --------------------
+async function safeGoto(page, url){
+  await page.goto(url, { waitUntil: "domcontentloaded" });
+  await Promise.race([ page.waitForLoadState("networkidle"), sleep(1500) ]);
+}
+async function acceptCookiesIfAny(page){
+  const selectors = [
+    'button:has-text("Accepter")',
+    'button:has-text("Tout accepter")',
+    'button:has-text("OK")',
+    'button[aria-label*="accepter" i]',
+    '[data-testid*="accept" i]'
+  ];
+  for (const sel of selectors){
+    const btn = page.locator(sel);
+    if (await btn.first().isVisible().catch(()=>false)) {
+      try { await btn.first().click({ timeout: 1500 }); break; } catch {}
+    }
+  }
+}
+async function selectTabTout(page){
+  const tab = page.getByRole("tab", { name: /tout/i });
+  if (await tab.first().isVisible().catch(()=>false)) {
+    try { await tab.first().click(); await sleep(500); return; } catch {}
+  }
+  const txtSel = ['button:has-text("Tout")','a:has-text("Tout")','[role="tab"]:has-text("Tout")'];
+  for (const s of txtSel){
+    const el = page.locator(s);
+    if (await el.first().isVisible().catch(()=>false)) {
+      try { await el.first().click({ timeout: 1500 }); await sleep(500); return; } catch {}
+    }
+  }
+}
+async function waitForCards(page){
+  await Promise.race([
+    page.waitForSelector('text=/Appels/i', { timeout: 8000 }),
+    sleep(2000)
+  ]);
+}
+
+// -------------------- Playwright launch --------------------
+function makeLaunchOptions(){
+  const iphone = devices["iPhone 13"];
+  return {
+    headless: HEADLESS,
+    args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"],
+    viewport: { width: 1280, height: 1800 },
+    userAgent: iphone.userAgent.replace(/iPhone.*?Safari\/[0-9.]+/i, "Chrome/123 Safari/537.36"),
+    locale: "fr-FR"
+  };
+}
+function shouldBlock(resourceType, url){
+  if (!BLOCK_RESOURCES) return false;
+  const t = resourceType;
+  if (["image","media","font"].includes(t)) return true;
+  const u = String(url);
+  if (/\.(png|jpe?g|webp|gif|svg|mp4|webm)(\?|$)/i.test(u)) return true;
+  if (/googletagmanager|google-analytics|doubleclick|facebook|hotjar|segment|adservice/i.test(u)) return true;
+  return false;
+}
+
+// -------------------- Airtable (optionnel) --------------------
+async function upsertAirtable(rows){
+  if (!AIRTABLE_TOKEN || !AIRTABLE_BASE || !AIRTABLE_TABLE) return;
+  const api = `https://api.airtable.com/v0/${AIRTABLE_BASE}/${encodeURIComponent(AIRTABLE_TABLE)}`;
+  const headers = { "Authorization": `Bearer ${AIRTABLE_TOKEN}`, "Content-Type": "application/json" };
+  const BATCH = 10;
+  for (let i = 0; i < rows.length; i += BATCH){
+    const slice = rows.slice(i, i + BATCH).map(r => ({ fields: r }));
+    try{
+      const res = await fetch(api, { method: "POST", headers, body: JSON.stringify({ records: slice }) });
+      if (!res.ok) console.error(`[Airtable] POST ${res.status}: ${await res.text()}`);
+    }catch(e){ console.error("[Airtable] Exception:", e.message); }
+  }
+}
+
+// -------------------- Hard stop global --------------------
+const STARTED_AT = Date.now();
+function hardStop(){
+  if ((Date.now() - STARTED_AT) > MAX_RUNTIME_MIN * 60_000) {
+    throw new Error("MAX_RUNTIME_REACHED");
+  }
+}
+
+// -------------------- MAIN --------------------
+(async () => {
+  ensureDir(OUT_DIR);
+
+  if (OP !== "yallo"){
+    console.log(`[INFO] OP=${OP} non supporté dans ce run. On ne scrape que Yallo (mobile).`);
+  }
+
+  const launchOptions = makeLaunchOptions();
+  const browser = await chromium.launch(launchOptions);
+  const context = await browser.newContext({
+    locale: "fr-FR",
+    geolocation: { latitude: 46.2044, longitude: 6.1432 },
+    permissions: ["geolocation"]
+  });
+
+  if (BLOCK_RESOURCES){
+    await context.route("**/*", route => {
+      const req = route.request();
+      if (shouldBlock(req.resourceType(), req.url())) route.abort();
+      else route.continue();
     });
   }
 
-  const rows = await runWithPool(context, urls);
-  await browser.close();
+  const rows = [];
+  try{
+    hardStop();
+    if (OP === "yallo"){
+      const y = await scrapeYalloMobile(context);
+      rows.push(...y);
+    }
+  } catch(e){
+    if (String(e.message).includes("MAX_RUNTIME_REACHED")) {
+      console.error("[HARD-STOP] Temps max atteint -> sortie.");
+    } else {
+      console.error("[ERROR]", e);
+    }
+  } finally {
+    await context.close().catch(()=>{});
+    await browser.close().catch(()=>{});
+  }
 
-  // Dédup par Référence
-  const map = new Map();
-  for (const r of rows) map.set(r["Référence de l'offre"], r);
-  const finalRows = [...map.values()];
+  // Toujours écrire un CSV valide (même vide) pour l’artefact
+  const csv = toCSV(rows);
+  fs.writeFileSync(OUT_CSV, csv, "utf8");
+  fs.writeFileSync(OUT_JSON, JSON.stringify({ at: nowIso(), rows }, null, 2), "utf8");
+  console.log(`[OK] Écrit: ${OUT_CSV} (${rows.length} lignes)`);
 
-  const outCSV = toCSV(finalRows);
-  const outPath = path.join(DATA_DIR, 'latest.csv');
-  await fs.writeFile(outPath, outCSV, 'utf8');
-  log(`✅ ${finalRows.length} offres écrites dans ${outPath}`);
-
-  // Airtable (optionnel)
-  try { await pushAirtable(finalRows); } catch (e) { log('Airtable:', e.message); }
-}
-
-main().catch(e => { console.error('❌ Fatal:', e); process.exit(1); });
+  if (rows.length && AIRTABLE_TOKEN) {
+    await upsertAirtable(rows);
+  }
+})().catch(err => {
+  console.error("[FATAL]", err);
+  process.exit(1);
+});
