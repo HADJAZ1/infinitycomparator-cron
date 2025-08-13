@@ -1,13 +1,30 @@
-name: Scrape daily
+name: Scrape (Yallo mobile)
 
 on:
   schedule:
-    - cron: "10 3 * * *"   # 03:10 UTC (≈ 05:10 Zurich l'été)
-  workflow_dispatch: {}     # bouton "Run workflow"
+    - cron: '10 0 * * *'   # Tous les jours 00:10 UTC (02:10 Europe/Zurich en été)
+  workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 30            # borne dure -> jamais 6h
+    permissions:
+      contents: read
+
+    # IMPORTANT: variables bornées pour éviter tout blocage
+    env:
+      OP: yallo                   # on cible UNIQUEMENT Yallo (mobile, onglet "Tout")
+      HEADLESS: "1"
+      BLOCK_RESOURCES: "1"
+      FAST_MODE: "1"
+      MAX_PAGES: "60"
+      NAV_TIMEOUT_MS: "25000"
+      MAX_RUNTIME_MIN: "10"
+      # Airtable (optionnel — ajoute-les dans Settings > Secrets and variables > Actions)
+      AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+      AIRTABLE_BASE:  ${{ secrets.AIRTABLE_BASE }}
+      AIRTABLE_TABLE: ${{ secrets.AIRTABLE_TABLE }}
 
     steps:
       - name: Checkout
@@ -16,24 +33,22 @@ jobs:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          # pas de cache => évite l'avertissement de lockfile manquant
+          node-version: '20'
+          cache: 'npm'
 
       - name: Install deps
-        run: |
-          npm i
-          npx playwright install --with-deps chromium
+        run: npm install      # pas "npm ci" si tu n’as pas de package-lock.json
+
+      - name: Install Playwright (Chromium + deps)
+        run: npx playwright install --with-deps chromium
 
       - name: Run scraper
         run: node scrape.mjs
-        env:
-          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
-          AIRTABLE_BASE:  ${{ secrets.AIRTABLE_BASE }}
-          AIRTABLE_TABLE: ${{ secrets.AIRTABLE_TABLE }}
 
       - name: Upload CSV (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: latest-csv
+          name: yallo-mobile-latest
           path: data/latest.csv
-          retention-days: 14
+          if-no-files-found: error
+          retention-days: 7
